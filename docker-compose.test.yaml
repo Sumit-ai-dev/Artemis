@@ -124,12 +124,12 @@ services:
   test-ftp-server-with-easy-password:
     image: stilliard/pure-ftpd:latest
     environment:
-        - FTP_USER_NAME=admin
-        - FTP_USER_PASS=12345
-        - FTP_USER_HOME=/dev/shm
+      - FTP_USER_NAME=admin
+      - FTP_USER_PASS=12345
+      - FTP_USER_HOME=/dev/shm
 
   test-old-joomla:
-    image: joomla:4.0.5-php8.0-apache  # this is an old image on purpose
+    image: joomla:4.0.5-php8.0-apache # this is an old image on purpose
     environment:
       JOOMLA_DB_HOST: test-old-joomla-mysql
       JOOMLA_DB_PASSWORD: example
@@ -250,6 +250,11 @@ services:
     command: systemctl start apache2.service
     volumes:
       - ./test/data/sql_injection_mysql/:/var/www/html/
+
+  test-apache-with-orm-injection:
+    image: php:8.0-apache
+    volumes:
+      - ./test/data/orm_injection/:/var/www/html/
 
   test-nginx-with-sni-tls:
     build:
