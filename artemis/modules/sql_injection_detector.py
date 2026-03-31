@@ -191,11 +191,74 @@ class SqlInjectionDetector(ArtemisBase):
         # fallback if no single param triggers SQLi
         return params
 
+    def minimize_headers(
+        self,
+        url: str,
+        header_keys: List[str],
+        payload: str,
+        minimization_mode: Literal["error", "time"],
+        baseline_payload: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Try to find the minimal set of headers that still triggers SQLi.
+        """
+        if minimization_mode == "error" and baseline_payload is None:
+            raise ValueError("baseline_payload is required for error-based minimization")
+
+        minimal_headers: List[str] = []
+        if minimization_mode == "error":
+            payload_without_effect = baseline_payload if baseline_payload is not None else ""
+        else:
+            payload_without_effect = self.change_sleep_to_0(payload)
+
+        for header_key in header_keys:
+            single_batch = (header_key,)
+            headers_with = self.create_headers_with_batch(
+                header_batch=single_batch, payload=payload, baseline_payload=payload_without_effect
+            )
+            headers_without = self.create_headers_with_batch(
+                header_batch=single_batch, payload=payload_without_effect, baseline_payload=payload_without_effect
+            )
+
+            if minimization_mode == "error":
+                error = self.contains_error(url, self.forgiving_http_get(url, headers=headers_with))
+                if not self.contains_error(url, self.forgiving_http_get(url, headers=headers_without)) and error:
+                    minimal_headers.append(header_key)
+                continue
+
+            if (
+                self.measure_request_time(url, headers=headers_without)
+                < Config.Modules.SqlInjectionDetector.SQL_INJECTION_TIME_THRESHOLD / 2
+                and self.measure_request_time(url, headers=headers_with)
+                >= Config.Modules.SqlInjectionDetector.SQL_INJECTION_TIME_THRESHOLD
+            ):
+                minimal_headers.append(header_key)
+
+        if minimal_headers:
+            capped_minimal_headers = minimal_headers[
+                : Config.Modules.SqlInjectionDetector.SQL_INJECTION_MINIMAL_PARAMS_MAX_LEN
+            ]
+            mode_label = "error-based" if minimization_mode == "error" else "time-based"
+            self.log.info(
+                "SQLi %s header minimization: %s -> %s",
+                mode_label,
+                header_keys,
+                capped_minimal_headers,
+            )
+            return capped_minimal_headers
+
+        return header_keys
+
     @staticmethod
-    def create_headers(payload: str) -> dict[str, str]:
+    def create_headers_with_batch(
+        header_batch: tuple[Any, ...], payload: str, baseline_payload: str = ""
+    ) -> dict[str, str]:
         headers = {}
         for key, value in HEADERS.items():
-            headers.update({key: value + payload})
+            if key in header_batch:
+                headers[key] = value + payload
+            else:
+                headers[key] = value + baseline_payload
         return headers
 
     @staticmethod
@@ -410,8 +473,10 @@ class SqlInjectionDetector(ArtemisBase):
                             return message
 
             for error_payload in sql_injection_error_payloads:
-                headers = self.create_headers(payload=error_payload)
-                headers_no_payload = self.create_headers(payload=not_error_payload)
+                headers = self.create_headers_with_batch(tuple(HEADERS.keys()), payload=error_payload)
+                headers_no_payload = self.create_headers_with_batch(
+                    tuple(HEADERS.keys()), payload=not_error_payload, baseline_payload=not_error_payload
+                )
 
                 error = self.contains_error(current_url, self.forgiving_http_get(current_url, headers=headers))
 
@@ -421,10 +486,19 @@ class SqlInjectionDetector(ArtemisBase):
                     )
                     and error
                 ):
+                    minimal_headers = self.minimize_headers(
+                        url=current_url,
+                        header_keys=list(HEADERS.keys()),
+                        payload=error_payload,
+                        baseline_payload=not_error_payload,
+                        minimization_mode="error",
+                    )
+                    reported_headers = {k: HEADERS[k] + error_payload for k in minimal_headers}
+
                     message.append(
                         {
                             "url": current_url,
-                            "headers": headers,
+                            "headers": reported_headers,
                             "matched_error": error,
                             "statement": "It appears that this URL is vulnerable to SQL injection through HTTP Headers",
                             "code": Statements.headers_sql_injection.value,
@@ -435,8 +509,12 @@ class SqlInjectionDetector(ArtemisBase):
 
             for sleep_payload in sql_injection_sleep_payloads:
                 flags = []
-                headers = self.create_headers(sleep_payload)
-                headers_no_sleep_payload = self.create_headers(self.change_sleep_to_0(sleep_payload))
+                headers = self.create_headers_with_batch(tuple(HEADERS.keys()), payload=sleep_payload)
+                headers_no_sleep_payload = self.create_headers_with_batch(
+                    tuple(HEADERS.keys()),
+                    payload=self.change_sleep_to_0(sleep_payload),
+                    baseline_payload=self.change_sleep_to_0(sleep_payload),
+                )
 
                 for _ in range(Config.Modules.SqlInjectionDetector.SQL_INJECTION_NUM_RETRIES_TIME_BASED):
                     # We explicitely want to re-check whether current URL is still time efficient
@@ -452,10 +530,18 @@ class SqlInjectionDetector(ArtemisBase):
                         break
 
                 if all(flags):
+                    minimal_headers = self.minimize_headers(
+                        url=current_url,
+                        header_keys=list(HEADERS.keys()),
+                        payload=sleep_payload,
+                        minimization_mode="time",
+                    )
+                    reported_headers = {k: HEADERS[k] + sleep_payload for k in minimal_headers}
+
                     message.append(
                         {
                             "url": current_url,
-                            "headers": headers,
+                            "headers": reported_headers,
                             "statement": "It appears that this URL is vulnerable to time-based SQL injection through HTTP Headers",
                             "code": Statements.headers_time_based_sql_injection.value,
                         }

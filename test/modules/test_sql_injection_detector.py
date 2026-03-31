@@ -170,3 +170,42 @@ class SqlInjectionParameterMinimizationTestCase(ArtemisModuleTestCase):
                         )
 
         self.assertEqual(minimal_params, ["a", "b", "c", "d", "e"])
+
+
+class SqlInjectionHeaderMinimizationTestCase(ArtemisModuleTestCase):
+    karton_class = SqlInjectionDetector
+
+    def test_minimize_headers_caps_error_mode(self) -> None:
+        headers = ["User-Agent", "Referer", "X-Forwarded-For", "Accept-Language", "Cookie", "Host", "Origin"]
+
+        def mocked_contains_error(url: str, response: object) -> str | None:
+            # Check the headers that were passed to the mock
+            if hasattr(response, "headers_sent"):
+                # If malicious payload "'\"" is in these specific headers, simulate error
+                vuln_headers = {"User-Agent", "Referer", "X-Forwarded-For", "Accept-Language", "Cookie", "Host"}
+                for k, v in response.headers_sent.items():
+                    if k in vuln_headers and v.endswith("'\""):
+                        return "error"
+            return None
+
+        # Mock a response object that carries the sent headers back so we can inspect them
+        class MockResponse:
+            def __init__(self, headers: dict[str, str]):
+                self.headers_sent = headers
+
+        def mocked_forgiving_http_get(url: str, headers: dict[str, str] = None) -> MockResponse:
+            return MockResponse(headers or {})
+
+        with patch("artemis.config.Config.Modules.SqlInjectionDetector") as mocked_config:
+            mocked_config.SQL_INJECTION_MINIMAL_PARAMS_MAX_LEN = 5
+            with patch.object(self.karton, "contains_error", side_effect=mocked_contains_error):
+                with patch.object(self.karton, "forgiving_http_get", side_effect=mocked_forgiving_http_get):
+                    minimal_headers = self.karton.minimize_headers(
+                        url="http://example.com/headers",
+                        header_keys=headers,
+                        payload="'\"",
+                        baseline_payload="-1",
+                        minimization_mode="error",
+                    )
+
+        self.assertEqual(minimal_headers, ["User-Agent", "Referer", "X-Forwarded-For", "Accept-Language", "Cookie"])
